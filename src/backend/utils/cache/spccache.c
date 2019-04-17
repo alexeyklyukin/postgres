@@ -221,3 +221,18 @@ get_tablespace_io_concurrency(Oid spcid)
 	else
 		return spc->opts->effective_io_concurrency;
 }
+
+/*
+ * get_tablespace_autovacuum_options
+ *
+ * 		Fetch per-tablespace autovacuum options for the given tablespace OID.
+ */
+AutoVacOpts *
+get_tablespace_autovacuum_options(Oid spcid)
+{
+	TableSpaceCacheEntry *spc = get_tablespace(spcid);
+
+	if (!spc->opts)
+		return NULL;
+	return &(spc->opts->autovacuum);
+}
