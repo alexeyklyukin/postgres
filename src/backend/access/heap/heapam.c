@@ -95,7 +95,7 @@ static void GetMultiXactIdHintBits(MultiXactId multi, uint16 *new_infomask,
 static TransactionId MultiXactIdGetUpdateXid(TransactionId xmax,
 											 uint16 t_infomask);
 static bool DoesMultiXactIdConflict(MultiXactId multi, uint16 infomask,
-									LockTupleMode lockmode);
+									LockTupleMode lockmode, bool *has_current_xid);
 static void MultiXactIdWait(MultiXactId multi, MultiXactStatus status, uint16 infomask,
 							Relation rel, ItemPointer ctid, XLTW_Oper oper,
 							int *remaining);
@@ -2547,15 +2547,22 @@ l1:
 		 */
 		if (infomask & HEAP_XMAX_IS_MULTI)
 		{
+			bool has_current_xid = false;
 			/* wait for multixact */
 			if (DoesMultiXactIdConflict((MultiXactId) xwait, infomask,
-										LockTupleExclusive))
+										LockTupleExclusive, &has_current_xid))
 			{
 				LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 
-				/* acquire tuple lock, if necessary */
-				heap_acquire_tuplock(relation, &(tp.t_self), LockTupleExclusive,
-									 LockWaitBlock, &have_tuple_lock);
+				/*
+				 * Acquire the lock, if necessary. Avoid acquiring it when
+				 * getting the stronger lock while holding a weaker one to
+				 * prevent deadlocks with other lockers that already have
+				 * a tuple lock and waiting for our transaction to finish.
+				 */
+				if (!has_current_xid)
+					heap_acquire_tuplock(relation, &(tp.t_self), LockTupleExclusive,
+										 LockWaitBlock, &have_tuple_lock);
 
 				/* wait for multixact */
 				MultiXactIdWait((MultiXactId) xwait, MultiXactStatusUpdate, infomask,
@@ -3126,15 +3133,23 @@ l2:
 		{
 			TransactionId update_xact;
 			int			remain;
+			bool 		has_current_xid = false;
 
 			if (DoesMultiXactIdConflict((MultiXactId) xwait, infomask,
-										*lockmode))
+										*lockmode, &has_current_xid))
 			{
 				LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 
-				/* acquire tuple lock, if necessary */
-				heap_acquire_tuplock(relation, &(oldtup.t_self), *lockmode,
-									 LockWaitBlock, &have_tuple_lock);
+				/*
+				 * Acquire the lock, if necessary. Avoid acquiring it when
+				 * getting the stronger lock while holding a weaker one to
+				 * prevent deadlocks with other lockers that already have
+				 * a tuple lock and waiting for our transaction to finish.
+				 */
+
+				if (!has_current_xid)
+					heap_acquire_tuplock(relation, &(oldtup.t_self), *lockmode,
+										 LockWaitBlock, &have_tuple_lock);
 
 				/* wait for multixact */
 				MultiXactIdWait((MultiXactId) xwait, mxact_status, infomask,
@@ -4028,6 +4043,7 @@ l3:
 		uint16		infomask;
 		uint16		infomask2;
 		bool		require_sleep;
+		bool		skip_tuple_lock;
 		ItemPointerData t_ctid;
 
 		/* must copy state data before unlocking buffer */
@@ -4053,6 +4069,7 @@ l3:
 		if (first_time)
 		{
 			first_time = false;
+			skip_tuple_lock = false;
 
 			if (infomask & HEAP_XMAX_IS_MULTI)
 			{
@@ -4080,6 +4097,21 @@ l3:
 						pfree(members);
 						result = TM_Ok;
 						goto out_unlocked;
+					}
+					else
+					{
+						/*
+						 * Avoid acquiring the tuple level lock.
+						 *
+						 * Otherwise, when promoting a weaker lock, we may
+						 * deadlock with another potential locker that has
+						 * acquired a conflicting row lock and waits for our
+						 * transaction to finish.
+						 *
+						 * Note that we will wait for the multixact
+						 * if required to avoid acquiring conflicting locks.
+						 */
+						skip_tuple_lock = true;
 					}
 				}
 
@@ -4235,7 +4267,7 @@ l3:
 			if (infomask & HEAP_XMAX_IS_MULTI)
 			{
 				if (!DoesMultiXactIdConflict((MultiXactId) xwait, infomask,
-											 mode))
+											 mode, NULL))
 				{
 					/*
 					 * No conflict, but if the xmax changed under us in the
@@ -4318,7 +4350,8 @@ l3:
 			 * this arranges that we stay at the head of the line while
 			 * rechecking tuple state.
 			 */
-			if (!heap_acquire_tuplock(relation, tid, mode, wait_policy,
+			if (!skip_tuple_lock &&
+				!heap_acquire_tuplock(relation, tid, mode, wait_policy,
 									  &have_tuple_lock))
 			{
 				/*
@@ -6516,10 +6549,12 @@ HeapTupleGetUpdateXid(HeapTupleHeader tuple)
  * tuple lock of the given strength?
  *
  * The passed infomask pairs up with the given multixact in the tuple header.
+ * has_current_xid is set when not-NULL if the given multixact contains current
+ * transaction.
  */
 static bool
 DoesMultiXactIdConflict(MultiXactId multi, uint16 infomask,
-						LockTupleMode lockmode)
+						LockTupleMode lockmode, bool *has_current_xid)
 {
 	int			nmembers;
 	MultiXactMember *members;
@@ -6540,15 +6575,24 @@ DoesMultiXactIdConflict(MultiXactId multi, uint16 infomask,
 			TransactionId memxid;
 			LOCKMODE	memlockmode;
 
-			memlockmode = LOCKMODE_from_mxstatus(members[i].status);
+			if (result && (has_current_xid == NULL || *has_current_xid))
+				break;
 
-			/* ignore members that don't conflict with the lock we want */
-			if (!DoLockModesConflict(memlockmode, wanted))
-				continue;
+			memlockmode = LOCKMODE_from_mxstatus(members[i].status);
 
 			/* ignore members from current xact */
 			memxid = members[i].xid;
 			if (TransactionIdIsCurrentTransactionId(memxid))
+			{
+				if (has_current_xid != NULL)
+					*has_current_xid = true;
+				continue;
+			}
+			else if (result)
+				continue;
+
+			/* ignore members that don't conflict with the lock we want */
+			if (!DoLockModesConflict(memlockmode, wanted))
 				continue;
 
 			if (ISUPDATE_from_mxstatus(members[i].status))
@@ -6567,10 +6611,11 @@ DoesMultiXactIdConflict(MultiXactId multi, uint16 infomask,
 			/*
 			 * Whatever remains are either live lockers that conflict with our
 			 * wanted lock, and updaters that are not aborted.  Those conflict
-			 * with what we want, so return true.
+			 * with what we want. Return true on the next loop iteration unless
+			 * we need to look for the current transaction among the multixact
+			 * members.
 			 */
 			result = true;
-			break;
 		}
 		pfree(members);
 	}
